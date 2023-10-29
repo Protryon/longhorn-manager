@@ -3,9 +3,11 @@ package monitor
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"github.com/pkg/errors"
+	"golang.org/x/sys/unix"
 
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
@@ -73,18 +75,21 @@ func getDiskConfig(diskType longhorn.DiskType, name, path string, client *engine
 
 func getFilesystemTypeDiskConfig(path string) (*util.DiskConfig, error) {
 	nsPath := iscsiutil.GetHostNamespacePath(util.HostProcPath)
-	nsExec, err := iscsiutil.NewNamespaceExecutor(nsPath)
-	if err != nil {
-		return nil, err
-	}
 	filePath := filepath.Join(path, util.DiskConfigFile)
-	output, err := nsExec.Execute("cat", []string{filePath})
+
+	fmt.Println("getFilesystemTypeDiskConfig", path)
+
+	output, err := iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*[]byte, error) {
+		out, err := os.ReadFile(filePath)
+		return &out, err
+	})
+	fmt.Println("getFilesystemTypeDiskConfig output", path, output, err)
 	if err != nil {
 		return nil, fmt.Errorf("cannot find config file %v on host: %v", filePath, err)
 	}
 
 	cfg := &util.DiskConfig{}
-	if err := json.Unmarshal([]byte(output), cfg); err != nil {
+	if err := json.Unmarshal(*output, cfg); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal %v content %v on host: %v", filePath, output, err)
 	}
 	return cfg, nil
@@ -129,33 +134,38 @@ func generateFilesystemTypeDiskConfig(path string) (*util.DiskConfig, error) {
 	}
 
 	nsPath := iscsiutil.GetHostNamespacePath(util.HostProcPath)
-	nsExec, err := iscsiutil.NewNamespaceExecutor(nsPath)
-	if err != nil {
-		return nil, err
-	}
 	filePath := filepath.Join(path, util.DiskConfigFile)
-	if _, err := nsExec.Execute("ls", []string{filePath}); err == nil {
+
+	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+		_, err := os.Stat(filePath)
+		return nil, err
+	})
+	if err == nil {
 		return nil, fmt.Errorf("disk cfg on %v exists, cannot override", filePath)
 	}
 
 	defer func() {
 		if err != nil {
-			if derr := util.DeleteDiskPathReplicaSubdirectoryAndDiskCfgFile(nsExec, path); derr != nil {
+			if derr := util.DeleteDiskPathReplicaSubdirectoryAndDiskCfgFile(nsPath, path); derr != nil {
 				err = errors.Wrapf(err, "cleaning up disk config path %v failed with error: %v", path, derr)
 			}
 
 		}
 	}()
 
-	if _, err := nsExec.ExecuteWithStdin("dd", []string{"of=" + filePath}, string(encoded)); err != nil {
+	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+		return nil, os.WriteFile(filePath, encoded, 0644)
+	})
+	if err != nil {
 		return nil, fmt.Errorf("cannot write to disk cfg on %v: %v", filePath, err)
 	}
 	if err := util.CreateDiskPathReplicaSubdirectory(path); err != nil {
 		return nil, err
 	}
-	if _, err := nsExec.Execute("sync", []string{filePath}); err != nil {
-		return nil, fmt.Errorf("cannot sync disk cfg on %v: %v", filePath, err)
-	}
+	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+		unix.Sync()
+		return nil, nil
+	})
 
 	return cfg, nil
 }

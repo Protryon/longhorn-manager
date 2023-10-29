@@ -1724,6 +1724,7 @@ func (c *VolumeController) openVolumeDependentResources(v *longhorn.Volume, e *l
 	}
 
 	replicaAddressMap := map[string]string{}
+	fmt.Println("openVolumeDependentResources", v, "\n", rs)
 	for _, r := range rs {
 		// Ignore unscheduled replicas
 		if r.Spec.NodeID == "" {

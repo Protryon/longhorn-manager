@@ -169,6 +169,8 @@ func (m *NodeMonitor) collectDiskData(node *longhorn.Node) map[string]*Collected
 		}
 	}()
 
+	fmt.Println("collectDiskData", node.Spec.Disks)
+
 	for diskName, disk := range node.Spec.Disks {
 		if !v2DataEngineEnabled && disk.Type == longhorn.DiskTypeBlock {
 			continue
@@ -179,6 +181,7 @@ func (m *NodeMonitor) collectDiskData(node *longhorn.Node) map[string]*Collected
 		nodeOrDiskEvicted := isNodeOrDiskEvicted(node, disk)
 
 		diskConfig, err := m.getDiskConfigHandler(disk.Type, diskName, disk.Path, diskServiceClient)
+		fmt.Println("collectDiskData diskConfig", disk.Type, diskName, disk.Path, diskConfig, err)
 		if err != nil {
 			if !types.ErrorIsNotFound(err) {
 				diskInfoMap[diskName] = NewDiskInfo(disk.Path, "", nodeOrDiskEvicted, nil,

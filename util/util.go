@@ -30,6 +30,7 @@ import (
 	"github.com/gorilla/handlers"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
 	"gopkg.in/yaml.v2"
@@ -481,18 +482,23 @@ func GetDiskStat(directory string) (stat *DiskStat, err error) {
 		err = errors.Wrapf(err, "cannot get disk stat of directory %v", directory)
 	}()
 	initiatorNSPath := iscsiutil.GetHostNamespacePath(HostProcPath)
-	mountPath := fmt.Sprintf("--mount=%s/mnt", initiatorNSPath)
-	output, err := Execute([]string{}, "nsenter", mountPath, "stat", "-fc", "{\"path\":\"%n\",\"fsid\":\"%i\",\"type\":\"%T\",\"freeBlock\":%f,\"totalBlock\":%b,\"blockSize\":%S}", directory)
-	if err != nil {
-		return nil, err
-	}
-	output = strings.Replace(output, "\n", "", -1)
 
-	fsStat := &FsStat{}
-	err = json.Unmarshal([]byte(output), fsStat)
-	if err != nil {
-		return nil, err
-	}
+	fsStat, err := iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, func() (*FsStat, error) {
+		var buf unix.Statfs_t
+		err := unix.Statfs(directory, &buf)
+		if err != nil {
+			return nil, err
+		}
+		return &FsStat{
+			Fsid:       fmt.Sprintf("%08x%08x", buf.Fsid.Val[0], buf.Fsid.Val[1]),
+			Path:       directory,
+			Type:       FsTypeName(buf.Type),
+			FreeBlock:  int64(buf.Bfree),
+			TotalBlock: int64(buf.Blocks),
+			BlockSize:  buf.Bsize,
+		}, nil
+	})
+	fmt.Println("GetDiskStat", directory, fsStat)
 
 	return &DiskStat{
 		DiskID:           fsStat.Fsid,
@@ -549,19 +555,20 @@ func RemoveHostDirectoryContent(directory string) (err error) {
 		return fmt.Errorf("prohibit removing the top level of directory %v", dir)
 	}
 	initiatorNSPath := iscsiutil.GetHostNamespacePath(HostProcPath)
-	nsExec, err := iscsiutil.NewNamespaceExecutor(initiatorNSPath)
-	if err != nil {
-		return err
-	}
 	// check if the directory already deleted
-	if _, err := nsExec.Execute("ls", []string{dir}); err != nil {
+	_, err = iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, func() (*interface{}, error) {
+		_, err := os.Stat(dir)
+		return nil, err
+	})
+	if err != nil {
 		logrus.Warnf("cannot find host directory %v for removal", dir)
 		return nil
 	}
-	if _, err := nsExec.Execute("rm", []string{"-rf", dir}); err != nil {
-		return err
-	}
-	return nil
+	_, err = iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, func() (*interface{}, error) {
+		return nil, os.RemoveAll(dir)
+	})
+
+	return err
 }
 
 type filteredLoggingHandler struct {
@@ -634,11 +641,11 @@ func ValidateTags(inputTags []string) ([]string, error) {
 
 func CreateDiskPathReplicaSubdirectory(path string) error {
 	nsPath := iscsiutil.GetHostNamespacePath(HostProcPath)
-	nsExec, err := iscsiutil.NewNamespaceExecutor(nsPath)
+	_, err := iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+		return nil, os.MkdirAll(filepath.Join(path, ReplicaDirectory), 0755)
+	})
+
 	if err != nil {
-		return err
-	}
-	if _, err := nsExec.Execute("mkdir", []string{"-p", filepath.Join(path, ReplicaDirectory)}); err != nil {
 		return errors.Wrapf(err, "error creating data path %v on host", path)
 	}
 
@@ -646,23 +653,37 @@ func CreateDiskPathReplicaSubdirectory(path string) error {
 }
 
 func DeleteDiskPathReplicaSubdirectoryAndDiskCfgFile(
-	nsExec *iscsiutil.NamespaceExecutor, path string) error {
+	nsPath string, path string) error {
 
 	var err error
 	dirPath := filepath.Join(path, ReplicaDirectory)
 	filePath := filepath.Join(path, DiskConfigFile)
 
 	// Check if the replica directory exist, delete it
-	if _, err := nsExec.Execute("ls", []string{dirPath}); err == nil {
-		if _, err := nsExec.Execute("rmdir", []string{dirPath}); err != nil {
+	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+		_, err := os.Stat(dirPath)
+		return nil, err
+	})
+	if err == nil {
+		_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+			return nil, os.Remove(dirPath)
+		})
+		if err != nil {
 			return errors.Wrapf(err, "error deleting data path %v on host", path)
 		}
 	}
 
 	// Check if the disk cfg file exist, delete it
-	if _, err := nsExec.Execute("ls", []string{filePath}); err == nil {
-		if _, err := nsExec.Execute("rm", []string{filePath}); err != nil {
-			err = errors.Wrapf(err, "error deleting disk cfg file %v on host", filePath)
+	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+		_, err := os.Stat(filePath)
+		return nil, err
+	})
+	if err == nil {
+		_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+			return nil, os.Remove(filePath)
+		})
+		if err != nil {
+			return errors.Wrapf(err, "error deleting data cfg file %v on host", path)
 		}
 	}
 
@@ -790,15 +811,29 @@ func GetPossibleReplicaDirectoryNames(diskPath string) (replicaDirectoryNames ma
 	directory := filepath.Join(diskPath, "replicas")
 
 	initiatorNSPath := iscsiutil.GetHostNamespacePath(HostProcPath)
-	mountPath := fmt.Sprintf("--mount=%s/mnt", initiatorNSPath)
-	command := fmt.Sprintf("find %s -type d -maxdepth 1 -mindepth 1 -regextype posix-extended -regex \".*-[a-zA-Z0-9]{8}$\" -exec basename {} \\;", directory)
-	output, err := Execute([]string{}, "nsenter", mountPath, "sh", "-c", command)
+
+	regex, err := regexp.Compile(".*-[a-zA-Z0-9]{8}$")
 	if err != nil {
 		return replicaDirectoryNames, err
 	}
 
-	names := strings.Split(output, "\n")
-	for _, name := range names {
+	output, err := iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, func() (*[]string, error) {
+		entries, err := os.ReadDir(directory)
+		var out []string
+		for _, entry := range entries {
+			if !entry.IsDir() || !regex.Match([]byte(entry.Name())) {
+				continue
+			}
+			out = append(out, entry.Name())
+		}
+		return &out, err
+	})
+
+	if err != nil {
+		return replicaDirectoryNames, err
+	}
+
+	for _, name := range *output {
 		if name != "" {
 			replicaDirectoryNames[name] = ""
 		}
@@ -815,8 +850,10 @@ func DeleteReplicaDirectory(diskPath, replicaDirectoryName string) (err error) {
 	path := filepath.Join(diskPath, "replicas", replicaDirectoryName)
 
 	initiatorNSPath := iscsiutil.GetHostNamespacePath(HostProcPath)
-	mountPath := fmt.Sprintf("--mount=%s/mnt", initiatorNSPath)
-	_, err = Execute([]string{}, "nsenter", mountPath, "rm", "-rf", path)
+
+	_, err = iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, func() (*interface{}, error) {
+		return nil, os.RemoveAll(path)
+	})
 	if err != nil {
 		return err
 	}
@@ -838,18 +875,17 @@ type VolumeMeta struct {
 
 func GetVolumeMeta(path string) (*VolumeMeta, error) {
 	nsPath := iscsiutil.GetHostNamespacePath(HostProcPath)
-	nsExec, err := iscsiutil.NewNamespaceExecutor(nsPath)
-	if err != nil {
-		return nil, err
-	}
 
-	output, err := nsExec.Execute("cat", []string{path})
+	output, err := iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*[]byte, error) {
+		out, err := os.ReadFile(path)
+		return &out, err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("cannot find volume meta %v on host: %v", path, err)
 	}
 
 	meta := &VolumeMeta{}
-	if err := json.Unmarshal([]byte(output), meta); err != nil {
+	if err := json.Unmarshal(*output, meta); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal %v content %v on host: %v", path, output, err)
 	}
 	return meta, nil
@@ -868,26 +904,41 @@ func GetPodIP(pod *corev1.Pod) (string, error) {
 
 func TrimFilesystem(volumeName string, encryptedDevice bool) error {
 	nsPath := iscsiutil.GetHostNamespacePath(HostProcPath)
-	nsExec, err := iscsiutil.NewNamespaceExecutor(nsPath)
-	if err != nil {
-		return err
-	}
 
 	deviceDir := RegularDeviceDirectory
 	if encryptedDevice {
 		deviceDir = EncryptedDeviceDirectory
 	}
 
-	mountOutput, err := nsExec.Execute("bash", []string{"-c", fmt.Sprintf("cat /proc/mounts | grep %s%s | awk '{print $2}'", deviceDir, volumeName)})
+	mountOutput, err := iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*string, error) {
+		out, err := os.ReadFile("/proc/mounts")
+		outStr := string(out)
+		return &outStr, err
+	})
 	if err != nil {
 		return errors.Wrapf(err, "cannot find volume %v mount info on host", volumeName)
 	}
+	mountList := strings.Split(strings.TrimSpace(*mountOutput), "\n")
+	// filter lines
+	mountListFiltered := mountList[:0]
 
-	mountList := strings.Split(strings.TrimSpace(mountOutput), "\n")
+	subStr := fmt.Sprintf("%s%s", deviceDir, volumeName)
+
+	for _, line := range mountList {
+		if strings.Contains(line, subStr) {
+			parts := strings.Split(line, " ")
+			if len(parts) > 1 {
+				mountListFiltered = append(mountListFiltered, parts[1])
+			}
+		}
+	}
 
 	var mountpoint string
-	for _, m := range mountList {
-		_, err = nsExec.Execute("stat", []string{m})
+	for _, m := range mountListFiltered {
+		_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+			_, err := os.Stat(m)
+			return nil, err
+		})
 		if err == nil {
 			mountpoint = m
 			break
@@ -899,7 +950,9 @@ func TrimFilesystem(volumeName string, encryptedDevice bool) error {
 		return fmt.Errorf("cannot find a valid mount point for volume %v", volumeName)
 	}
 
-	_, err = nsExec.Execute("fstrim", []string{mountpoint})
+	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+		return nil, exec.Command("fstrim", mountpoint).Run()
+	})
 	if err != nil {
 		return errors.Wrapf(err, "cannot find volume %v mount info on host", volumeName)
 	}
