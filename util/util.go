@@ -25,6 +25,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/handlers"
@@ -477,15 +478,25 @@ type FsStat struct {
 	BlockSize  int64
 }
 
+func statfs(path string, buf *unix.Statfs_t) (err error) {
+	var _p0 *byte
+	_p0, err = unix.BytePtrFromString(path)
+	if err != nil {
+		return
+	}
+	_, _, err = unix.RawSyscall(unix.SYS_STATFS, uintptr(unsafe.Pointer(_p0)), uintptr(unsafe.Pointer(buf)), 0)
+	return
+}
+
 func GetDiskStat(directory string) (stat *DiskStat, err error) {
 	defer func() {
 		err = errors.Wrapf(err, "cannot get disk stat of directory %v", directory)
 	}()
 	initiatorNSPath := iscsiutil.GetHostNamespacePath(HostProcPath)
 
-	fsStat, err := iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, func() (*FsStat, error) {
+	fsStat, err := iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, time.Minute, func() (*FsStat, error) {
 		var buf unix.Statfs_t
-		err := unix.Statfs(directory, &buf)
+		err := statfs(directory, &buf)
 		if err != nil {
 			return nil, err
 		}
@@ -498,7 +509,10 @@ func GetDiskStat(directory string) (stat *DiskStat, err error) {
 			BlockSize:  buf.Bsize,
 		}, nil
 	})
-	fmt.Println("GetDiskStat", directory, fsStat)
+	fmt.Println("GetDiskStat", directory, fsStat, err)
+	if err != nil {
+		return nil, err
+	}
 
 	return &DiskStat{
 		DiskID:           fsStat.Fsid,
@@ -556,7 +570,7 @@ func RemoveHostDirectoryContent(directory string) (err error) {
 	}
 	initiatorNSPath := iscsiutil.GetHostNamespacePath(HostProcPath)
 	// check if the directory already deleted
-	_, err = iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, func() (*interface{}, error) {
+	_, err = iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, time.Minute, func() (*interface{}, error) {
 		_, err := os.Stat(dir)
 		return nil, err
 	})
@@ -564,7 +578,7 @@ func RemoveHostDirectoryContent(directory string) (err error) {
 		logrus.Warnf("cannot find host directory %v for removal", dir)
 		return nil
 	}
-	_, err = iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, func() (*interface{}, error) {
+	_, err = iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, time.Minute, func() (*interface{}, error) {
 		return nil, os.RemoveAll(dir)
 	})
 
@@ -641,7 +655,7 @@ func ValidateTags(inputTags []string) ([]string, error) {
 
 func CreateDiskPathReplicaSubdirectory(path string) error {
 	nsPath := iscsiutil.GetHostNamespacePath(HostProcPath)
-	_, err := iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+	_, err := iscsiutil.ForkAndSwitchToNamespace(nsPath, time.Minute, func() (*interface{}, error) {
 		return nil, os.MkdirAll(filepath.Join(path, ReplicaDirectory), 0755)
 	})
 
@@ -660,12 +674,12 @@ func DeleteDiskPathReplicaSubdirectoryAndDiskCfgFile(
 	filePath := filepath.Join(path, DiskConfigFile)
 
 	// Check if the replica directory exist, delete it
-	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, time.Minute, func() (*interface{}, error) {
 		_, err := os.Stat(dirPath)
 		return nil, err
 	})
 	if err == nil {
-		_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+		_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, time.Minute, func() (*interface{}, error) {
 			return nil, os.Remove(dirPath)
 		})
 		if err != nil {
@@ -674,12 +688,12 @@ func DeleteDiskPathReplicaSubdirectoryAndDiskCfgFile(
 	}
 
 	// Check if the disk cfg file exist, delete it
-	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, time.Minute, func() (*interface{}, error) {
 		_, err := os.Stat(filePath)
 		return nil, err
 	})
 	if err == nil {
-		_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+		_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, time.Minute, func() (*interface{}, error) {
 			return nil, os.Remove(filePath)
 		})
 		if err != nil {
@@ -817,11 +831,11 @@ func GetPossibleReplicaDirectoryNames(diskPath string) (replicaDirectoryNames ma
 		return replicaDirectoryNames, err
 	}
 
-	output, err := iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, func() (*[]string, error) {
+	outputRaw, err := iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, time.Minute, func() (*[]string, error) {
 		entries, err := os.ReadDir(directory)
 		var out []string
 		for _, entry := range entries {
-			if !entry.IsDir() || !regex.Match([]byte(entry.Name())) {
+			if !entry.IsDir() {
 				continue
 			}
 			out = append(out, entry.Name())
@@ -829,11 +843,18 @@ func GetPossibleReplicaDirectoryNames(diskPath string) (replicaDirectoryNames ma
 		return &out, err
 	})
 
+	var output []string
+	for _, out := range *outputRaw {
+		if regex.Match([]byte(out)) {
+			output = append(output, out)
+		}
+	}
+
 	if err != nil {
 		return replicaDirectoryNames, err
 	}
 
-	for _, name := range *output {
+	for _, name := range output {
 		if name != "" {
 			replicaDirectoryNames[name] = ""
 		}
@@ -851,7 +872,7 @@ func DeleteReplicaDirectory(diskPath, replicaDirectoryName string) (err error) {
 
 	initiatorNSPath := iscsiutil.GetHostNamespacePath(HostProcPath)
 
-	_, err = iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, func() (*interface{}, error) {
+	_, err = iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, time.Minute, func() (*interface{}, error) {
 		return nil, os.RemoveAll(path)
 	})
 	if err != nil {
@@ -876,7 +897,7 @@ type VolumeMeta struct {
 func GetVolumeMeta(path string) (*VolumeMeta, error) {
 	nsPath := iscsiutil.GetHostNamespacePath(HostProcPath)
 
-	output, err := iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*[]byte, error) {
+	output, err := iscsiutil.ForkAndSwitchToNamespace(nsPath, time.Minute, func() (*[]byte, error) {
 		out, err := os.ReadFile(path)
 		return &out, err
 	})
@@ -910,7 +931,7 @@ func TrimFilesystem(volumeName string, encryptedDevice bool) error {
 		deviceDir = EncryptedDeviceDirectory
 	}
 
-	mountOutput, err := iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*string, error) {
+	mountOutput, err := iscsiutil.ForkAndSwitchToNamespace(nsPath, time.Minute, func() (*string, error) {
 		out, err := os.ReadFile("/proc/mounts")
 		outStr := string(out)
 		return &outStr, err
@@ -935,7 +956,7 @@ func TrimFilesystem(volumeName string, encryptedDevice bool) error {
 
 	var mountpoint string
 	for _, m := range mountListFiltered {
-		_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+		_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, time.Minute, func() (*interface{}, error) {
 			_, err := os.Stat(m)
 			return nil, err
 		})
@@ -950,7 +971,7 @@ func TrimFilesystem(volumeName string, encryptedDevice bool) error {
 		return fmt.Errorf("cannot find a valid mount point for volume %v", volumeName)
 	}
 
-	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, time.Hour, func() (*interface{}, error) {
 		return nil, exec.Command("fstrim", mountpoint).Run()
 	})
 	if err != nil {

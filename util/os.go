@@ -2,11 +2,14 @@ package util
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
+	"golang.org/x/sys/unix"
 
 	iscsiutil "github.com/longhorn/go-iscsi-helper/util"
 )
@@ -19,9 +22,14 @@ const (
 func GetHostKernelRelease() (string, error) {
 	initiatorNSPath := iscsiutil.GetHostNamespacePath(HostProcPath)
 
-	output, err := iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, func() (*string, error) {
-		out, err := Execute([]string{}, "uname", "-r")
-		return &out, err
+	output, err := iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, time.Second*5, func() (*string, error) {
+		var uname unix.Utsname
+		err := unix.Uname(&uname)
+		if err != nil {
+			return nil, err
+		}
+		nulIndex := string(bytes.TrimRight(uname.Release[:], "\x00"))
+		return &nulIndex, err
 	})
 	if err != nil {
 		return "", err
@@ -33,7 +41,7 @@ func GetHostKernelRelease() (string, error) {
 func GetHostOSDistro() (string, error) {
 	initiatorNSPath := iscsiutil.GetHostNamespacePath(HostProcPath)
 
-	output, err := iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, func() (*string, error) {
+	output, err := iscsiutil.ForkAndSwitchToNamespace(initiatorNSPath, time.Minute, func() (*string, error) {
 		out, err := os.ReadFile(OsReleasePath)
 		outStr := string(out)
 		return &outStr, err

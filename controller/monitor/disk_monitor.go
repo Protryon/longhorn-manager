@@ -175,6 +175,7 @@ func (m *NodeMonitor) collectDiskData(node *longhorn.Node) map[string]*Collected
 		if !v2DataEngineEnabled && disk.Type == longhorn.DiskTypeBlock {
 			continue
 		}
+		fmt.Println("collectDiskData pre", disk.Type, diskName, disk.Path)
 
 		orphanedReplicaDirectoryNames := map[string]string{}
 
@@ -211,6 +212,7 @@ func (m *NodeMonitor) collectDiskData(node *longhorn.Node) map[string]*Collected
 				continue
 			}
 		}
+		fmt.Println("collectDiskData part2")
 
 		stat, err := m.getDiskStatHandler(disk.Type, diskName, disk.Path, diskServiceClient)
 		if err != nil {
@@ -220,22 +222,26 @@ func (m *NodeMonitor) collectDiskData(node *longhorn.Node) map[string]*Collected
 					diskName, node.Spec.Disks[diskName].Path, node.Name, err))
 			continue
 		}
+		fmt.Println("collectDiskData part3", stat)
 
 		replicaInstanceNames, err := m.getReplicaInstanceNamesHandler(disk.Type, node, diskName, diskConfig.DiskUUID, disk.Path, diskServiceClient)
 		if err != nil {
 			logrus.WithError(err).Warnf("Failed to get replica instance names for disk %v(%v) on node %v", diskName, disk.Path, node.Name)
 			continue
 		}
+		fmt.Println("collectDiskData part4", replicaInstanceNames)
 
 		orphanedReplicaDirectoryNames, err = m.getOrphanedReplicaInstanceNames(disk.Type, node, diskName, diskConfig.DiskUUID, disk.Path, replicaInstanceNames)
 		if err != nil {
 			logrus.WithError(err).Warnf("Failed to get orphaned replica instance names for disk %v(%v) on node %v", diskName, disk.Path, node.Name)
 			continue
 		}
+		fmt.Println("collectDiskData part5", orphanedReplicaDirectoryNames)
 
 		diskInfoMap[diskName] = NewDiskInfo(disk.Path, diskConfig.DiskUUID, nodeOrDiskEvicted, stat,
 			orphanedReplicaDirectoryNames, string(longhorn.DiskConditionReasonNoDiskInfo), "")
 	}
+	fmt.Println("collectDiskData done", diskInfoMap)
 
 	return diskInfoMap
 }

@@ -1724,15 +1724,16 @@ func (c *VolumeController) openVolumeDependentResources(v *longhorn.Volume, e *l
 	}
 
 	replicaAddressMap := map[string]string{}
-	fmt.Println("openVolumeDependentResources", v, "\n", rs)
+	jsv, _ := json.Marshal(v)
+	fmt.Println("openVolumeDependentResources", string(jsv), "\n", rs)
 	for _, r := range rs {
 		// Ignore unscheduled replicas
 		if r.Spec.NodeID == "" {
 			continue
 		}
-		if r.Spec.Image != v.Status.CurrentImage {
-			continue
-		}
+		// if r.Spec.Image != v.Status.CurrentImage {
+		// 	continue
+		// }
 		if r.Spec.EngineName != e.Name {
 			continue
 		}
@@ -2685,6 +2686,10 @@ func (c *VolumeController) upgradeEngineForVolume(v *longhorn.Volume, es map[str
 		return err
 	}
 	if e == nil {
+		return nil
+	}
+
+	if v.Spec.Image == "" {
 		return nil
 	}
 

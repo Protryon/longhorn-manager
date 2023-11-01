@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
@@ -79,11 +80,11 @@ func getFilesystemTypeDiskConfig(path string) (*util.DiskConfig, error) {
 
 	fmt.Println("getFilesystemTypeDiskConfig", path)
 
-	output, err := iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*[]byte, error) {
+	output, err := iscsiutil.ForkAndSwitchToNamespace(nsPath, time.Minute, func() (*[]byte, error) {
 		out, err := os.ReadFile(filePath)
 		return &out, err
 	})
-	fmt.Println("getFilesystemTypeDiskConfig output", path, output, err)
+	fmt.Println("getFilesystemTypeDiskConfig output", path, string(*output), err)
 	if err != nil {
 		return nil, fmt.Errorf("cannot find config file %v on host: %v", filePath, err)
 	}
@@ -136,7 +137,9 @@ func generateFilesystemTypeDiskConfig(path string) (*util.DiskConfig, error) {
 	nsPath := iscsiutil.GetHostNamespacePath(util.HostProcPath)
 	filePath := filepath.Join(path, util.DiskConfigFile)
 
-	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+	fmt.Println("generateFilesystemTypeDiskConfig", path)
+
+	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, time.Minute, func() (*interface{}, error) {
 		_, err := os.Stat(filePath)
 		return nil, err
 	})
@@ -153,7 +156,7 @@ func generateFilesystemTypeDiskConfig(path string) (*util.DiskConfig, error) {
 		}
 	}()
 
-	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, time.Minute, func() (*interface{}, error) {
 		return nil, os.WriteFile(filePath, encoded, 0644)
 	})
 	if err != nil {
@@ -162,7 +165,7 @@ func generateFilesystemTypeDiskConfig(path string) (*util.DiskConfig, error) {
 	if err := util.CreateDiskPathReplicaSubdirectory(path); err != nil {
 		return nil, err
 	}
-	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, func() (*interface{}, error) {
+	_, err = iscsiutil.ForkAndSwitchToNamespace(nsPath, time.Minute, func() (*interface{}, error) {
 		unix.Sync()
 		return nil, nil
 	})
